@@ -52,6 +52,7 @@ try:
     from .thinking import ThinkingReader
     from .stream import AntigravityStream, collect_stream_completion
     from . import soul as _soul
+    from .alias import mask as _mask
 except ImportError:
     from models import (
         _FALLBACK_MODELS,
@@ -83,6 +84,7 @@ except ImportError:
     from thinking import ThinkingReader
     from stream import AntigravityStream, collect_stream_completion
     import soul as _soul
+    from alias import mask as _mask
 
 logger = logging.getLogger(__name__)
 
@@ -463,7 +465,7 @@ class AntigravityClient:
             return False
         rules = _soul.build_rules(_soul.system_parts_of(messages, _render_message_content), _PROMPT_PREAMBLE)
         try:
-            digest = _soul.write_rules(self._cwd, rules)
+            digest = _soul.write_rules(self._cwd, _mask(rules))
         except OSError as exc:
             logger.warning("Antigravity: could not write workspace rules (%s); inlining them", exc)
             return False
@@ -553,7 +555,7 @@ class AntigravityClient:
         thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
         try:
             if proc.stdin:
-                proc.stdin.write(prompt_text + "\n")
+                proc.stdin.write(_mask(prompt_text) + "\n")
                 proc.stdin.flush()
                 proc.stdin.close()
         except OSError:
@@ -635,7 +637,7 @@ class AntigravityClient:
                     )
 
                 thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
-                event_msg = {"event": "user", "message": {"content": prompt_payload}}
+                event_msg = {"event": "user", "message": {"content": _mask(prompt_payload)}}
                 try:
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
@@ -648,7 +650,7 @@ class AntigravityClient:
                     )
                     thinking_reader.close()
                     thinking_reader = ThinkingReader.before_request(self._isolated_gemini_dir)
-                    event_msg = {"event": "user", "message": {"content": prompt_payload}}
+                    event_msg = {"event": "user", "message": {"content": _mask(prompt_payload)}}
                     proc.stdin.write(json.dumps(event_msg) + "\n")
                     proc.stdin.flush()
 

@@ -18,10 +18,12 @@ try:
     from .process import _check_early_quota_error
     from .prompt import _longest_tool_call_prefix_match, _parse_tool_block
     from . import native_tools as _native_tools
+    from .alias import StreamUnmasker, unmask
 except ImportError:
     from process import _check_early_quota_error
     from prompt import _longest_tool_call_prefix_match, _parse_tool_block
     import native_tools as _native_tools
+    from alias import StreamUnmasker, unmask
 
 logger = logging.getLogger(__name__)
 
@@ -218,6 +220,8 @@ class AntigravityStream(Iterator[Any]):
         self._reader_stop = threading.Event()
         self._reader_thread = None
         self._thinking_next_poll = 0.0
+        self._content_alias = StreamUnmasker()
+        self._reasoning_alias = StreamUnmasker()
         self.proc = proc
         self.client = client
         self.model = model
@@ -520,6 +524,14 @@ class AntigravityStream(Iterator[Any]):
         finish_reason: str | None = None,
         reasoning_content: str | None = None,
     ) -> Any:
+        content = self._content_alias.feed(content) if content else content
+        reasoning_content = self._reasoning_alias.feed(reasoning_content) if reasoning_content else reasoning_content
+        if tool_calls or finish_reason:
+            content = (content or "") + self._content_alias.flush() or None
+            reasoning_content = (reasoning_content or "") + self._reasoning_alias.flush() or None
+        for call in tool_calls or ():
+            call.function.name = unmask(call.function.name)
+            call.function.arguments = unmask(call.function.arguments)
         delta = SimpleNamespace(
             role="assistant",
             content=content,
