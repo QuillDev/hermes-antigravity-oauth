@@ -177,6 +177,22 @@ class ACPVisionTests(unittest.TestCase):
         self.addCleanup(client.close)
         return client
 
+    def test_empty_args_from_host_fall_back_to_acp(self):
+        spawned: list[list[str]] = []
+
+        def fake_popen(cmd, **kw):
+            spawned.append(cmd)
+            return _FakeACPProcess()
+
+        with patch("client.is_authenticated", return_value=True), patch("subprocess.Popen", side_effect=fake_popen):
+            client = self._make_client(args=[])
+            resp = client.chat.completions.create(
+                model="gemini-4-neon-high",
+                messages=[{"role": "user", "content": "hi"}],
+            )
+        self.assertEqual(resp.choices[0].message.content, "ok")
+        self.assertEqual(spawned[0][:2], ["agy", "acp"])
+
     def test_profile_declares_acp_args_and_model_vision_capabilities(self):
         profile = plugin.antigravity_profile
         self.assertEqual(profile.process_args, ACP_DEFAULT_ARGS)

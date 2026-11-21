@@ -273,7 +273,8 @@ class AntigravityClient:
         self.base_url = base_url or AGY_MARKER_BASE_URL
         self._command = command or resolve_agy_command()
         env_transport = os.environ.get("ANTIGRAVITY_TRANSPORT", "").strip().lower()
-        if args is not None:
+        # The host hands over args=[] when it has no override; that means "use the default".
+        if args:
             self._args = list(args)
         elif env_transport == "stream-json":
             self._args = ["--output-format", "stream-json", "--disable-slash-commands"]
