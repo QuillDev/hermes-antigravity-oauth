@@ -1,7 +1,10 @@
 """agy-native tool steps become Hermes tool calls; unmappable ones stay neutralized."""
 
 import json
+import os
 import sys
+
+os.environ["ANTIGRAVITY_TRANSPORT"] = "stream-json"
 import tempfile
 import unittest
 from pathlib import Path

@@ -22,6 +22,8 @@ if str(plugin_dir) not in sys.path:
 # package name and get_provider_profile() would return it, so patches against
 # `antigravity_plugin_entry` miss and the real agy binary runs.
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="agy_test_home_")
+# This suite mocks stream-json stdout; ACP has its own suite in tests/test_acp_vision.py.
+os.environ["ANTIGRAVITY_TRANSPORT"] = "stream-json"
 
 try:
     from providers import get_provider_profile
@@ -846,14 +848,15 @@ class AntigravityPluginTests(unittest.TestCase):
         # explicit cwd is never cleaned by close() — addCleanup removes it.
         tmp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(tmp_dir.cleanup)
-        client = AntigravityClient(cwd=tmp_dir.name)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ANTIGRAVITY_TRANSPORT", None)
+            client = AntigravityClient(cwd=tmp_dir.name)
         self.assertNotIn("--dangerously-skip-permissions", client._args)
-        self.assertIn("--disable-slash-commands", client._args)
-        self.assertIn("--output-format", client._args)
+        self.assertIn("acp", client._args)
         profile = get_provider_profile("antigravity-oauth")
+        assert profile is not None
         self.assertNotIn("--dangerously-skip-permissions", profile.process_args)
-        self.assertIn("--disable-slash-commands", profile.process_args)
-        self.assertIn("--output-format", profile.process_args)
+        self.assertIn("acp", profile.process_args)
 
     def test_native_tool_step_neutralization_in_stream(self):
         # TemporaryDirectory (not /tmp): on Windows "/tmp" resolves to a

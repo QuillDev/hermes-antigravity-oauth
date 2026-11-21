@@ -23,9 +23,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 try:
-    from .models import _CLI_EFFORTS, _FALLBACK_MODELS, _normalize_effort, supports_effort_flag
+    from .acp import ACP_DEFAULT_ARGS
+    from .models import (
+        MODEL_CAPABILITIES,
+        _CLI_EFFORTS,
+        _FALLBACK_MODELS,
+        _normalize_effort,
+        supports_effort_flag,
+    )
 except ImportError:  # flat source tree under test
-    from models import _CLI_EFFORTS, _FALLBACK_MODELS, _normalize_effort, supports_effort_flag
+    from acp import ACP_DEFAULT_ARGS
+    from models import (
+        MODEL_CAPABILITIES,
+        _CLI_EFFORTS,
+        _FALLBACK_MODELS,
+        _normalize_effort,
+        supports_effort_flag,
+    )
 
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@+-]*")
 _TABLE_HEADERS = {"id", "model", "model id", "model_id"}
@@ -274,12 +288,13 @@ antigravity_profile = AntigravityOAuthProfile(
     api_mode="chat_completions",
     auth_type="external_process",
     process_command="agy",
-    process_args=("--output-format", "stream-json", "--disable-slash-commands"),
+    process_args=ACP_DEFAULT_ARGS,
     process_command_env_vars=("ANTIGRAVITY_COMMAND", "AGY_CLI_PATH", "ANTIGRAVITY_CLI_PATH"),
     process_args_env_var="ANTIGRAVITY_ARGS",
     default_aux_model="",
     fallback_models=_FALLBACK_MODELS,
     supports_vision=True,
+    model_capabilities=MODEL_CAPABILITIES,
     classify_api_error=_classify_antigravity_error,
     auth_handler=antigravity_auth_handler,
 )

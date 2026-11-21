@@ -26,7 +26,10 @@ import contextlib
 import inspect
 import io
 import json
+import os
 import sys
+
+os.environ["ANTIGRAVITY_TRANSPORT"] = "stream-json"
 import tempfile
 import threading
 import time
