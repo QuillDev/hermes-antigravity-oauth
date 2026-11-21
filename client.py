@@ -39,10 +39,19 @@ try:
         setup_isolated_home,
         terminate_process,
     )
+    from .acp import (
+        ACP_DEFAULT_ARGS,
+        ACPWorker,
+        AntigravityACPStream,
+        is_acp_args,
+        spawn_acp_worker,
+    )
     from .prompt import (
         _PROMPT_PREAMBLE,
         _ROLE_LABELS,
+        _format_delta_acp_blocks,
         _format_delta_prompt,
+        _format_messages_as_acp_blocks,
         _format_messages_as_prompt,
         _longest_tool_call_prefix_match,
         _messages_match_prefix,
@@ -54,6 +63,13 @@ try:
     from . import soul as _soul
     from .alias import mask as _mask
 except ImportError:
+    from acp import (
+        ACP_DEFAULT_ARGS,
+        ACPWorker,
+        AntigravityACPStream,
+        is_acp_args,
+        spawn_acp_worker,
+    )
     from models import (
         _FALLBACK_MODELS,
         _MODEL_ALIASES,
@@ -74,7 +90,9 @@ except ImportError:
     from prompt import (
         _PROMPT_PREAMBLE,
         _ROLE_LABELS,
+        _format_delta_acp_blocks,
         _format_delta_prompt,
+        _format_messages_as_acp_blocks,
         _format_messages_as_prompt,
         _longest_tool_call_prefix_match,
         _messages_match_prefix,
@@ -254,7 +272,14 @@ class AntigravityClient:
         self.api_key = api_key or "antigravity-directsdk"
         self.base_url = base_url or AGY_MARKER_BASE_URL
         self._command = command or resolve_agy_command()
-        self._args = list(args or ["--output-format", "stream-json", "--disable-slash-commands"])
+        env_transport = os.environ.get("ANTIGRAVITY_TRANSPORT", "").strip().lower()
+        if args is not None:
+            self._args = list(args)
+        elif env_transport == "stream-json":
+            self._args = ["--output-format", "stream-json", "--disable-slash-commands"]
+        else:
+            self._args = list(ACP_DEFAULT_ARGS)
+        self._use_acp = env_transport != "stream-json" and is_acp_args(self._args)
         self._temp_dir = None
         if cwd:
             self._cwd = cwd
@@ -297,6 +322,7 @@ class AntigravityClient:
         # without timeout): they touch no client state, and moving them
         # out of the locked region would trade the deadlock for races.
         self._lock = threading.RLock()
+        self._acp_worker: ACPWorker | None = None
         self._worker_proc: subprocess.Popen | None = None
         self._worker_conversation_id = ""
         self._worker_model: str | None = None
@@ -434,6 +460,8 @@ class AntigravityClient:
             _force_rmtree(temp_dir.name)
 
     def _terminate_worker_locked(self) -> None:
+        acp_worker = self._acp_worker
+        self._acp_worker = None
         if self._worker_proc is not None:
             proc = self._worker_proc
             self._worker_proc = None
@@ -442,7 +470,12 @@ class AntigravityClient:
             self._worker_effort = None
             self._worker_history = []
             self._active_processes.discard(proc)
-            self._terminate_process(proc)
+            if acp_worker is not None:
+                acp_worker.close()
+            else:
+                self._terminate_process(proc)
+        elif acp_worker is not None:
+            acp_worker.close()
         # The session is gone: any later usage from it belongs to a dead
         # session, and the next spawn must start from a clean baseline.
         self._worker_usage_baseline = {}
@@ -515,6 +548,175 @@ class AntigravityClient:
             self._worker_usage_baseline = {}
             self._active_processes.add(proc)
             return proc
+
+    def _get_or_spawn_acp_worker(self, model: str, effort: str | None) -> ACPWorker:
+        with self._lock:
+            if (
+                self._acp_worker is not None
+                and self._acp_worker.proc.poll() is None
+                and self._worker_model == model
+                and self._worker_effort == effort
+            ):
+                return self._acp_worker
+
+            self._terminate_worker_locked()
+
+            worker = spawn_acp_worker(
+                command=self._command,
+                args=self._args,
+                cwd=self._cwd,
+                env=self._child_env(),
+                model=model,
+                effort=effort,
+                terminate_fn=self._terminate_process,
+                popen_fn=subprocess.Popen,
+            )
+            self._acp_worker = worker
+            self._worker_proc = worker.proc
+            self._worker_conversation_id = worker.session_id
+            self._worker_model = model
+            self._worker_effort = effort
+            self._worker_history = []
+            self._worker_usage_baseline = {}
+            self._active_processes.add(worker.proc)
+            return worker
+
+    def _run_acp_oneshot_completion(
+        self,
+        *,
+        model: str,
+        effort: str | None,
+        messages: list[dict[str, Any]],
+        timeout: float,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+        stream: bool,
+        reasoning_emitter=None,
+    ) -> Any:
+        rules = self._sync_workspace_rules(messages)
+        prompt_blocks = _format_messages_as_acp_blocks(
+            messages,
+            model=model,
+            tools=tools,
+            tool_choice=tool_choice,
+            rules_in_workspace=rules,
+        )
+        worker = spawn_acp_worker(
+            command=self._command,
+            args=self._args,
+            cwd=self._cwd,
+            env=self._child_env(),
+            model=model,
+            effort=effort,
+            terminate_fn=self._terminate_process,
+            popen_fn=subprocess.Popen,
+        )
+        with self._lock:
+            self._active_processes.add(worker.proc)
+        try:
+            req_id = worker.send_prompt(prompt_blocks)
+        except Exception:
+            with self._lock:
+                self._active_processes.discard(worker.proc)
+            worker.close()
+            raise
+
+        stream_iter = AntigravityACPStream(
+            worker=worker,
+            req_id=req_id,
+            client=self,
+            model=model,
+            timeout=timeout,
+            tools=tools,
+            is_worker=False,
+        )
+        if stream:
+            return stream_iter
+        return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
+
+    def _create_acp_completion(
+        self,
+        *,
+        model: str,
+        effort: str | None,
+        messages: list[dict[str, Any]],
+        timeout: float,
+        tools: list[dict[str, Any]] | None,
+        tool_choice: Any,
+        stream: bool,
+        reasoning_emitter=None,
+    ) -> Any:
+        worker_acquired = self._worker_lock.acquire(blocking=False)
+        if not worker_acquired:
+            return self._run_acp_oneshot_completion(
+                model=model,
+                effort=effort,
+                messages=messages,
+                timeout=timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+                reasoning_emitter=reasoning_emitter,
+            )
+        try:
+            rules = self._sync_workspace_rules(messages)
+            worker = self._get_or_spawn_acp_worker(model, effort)
+            with self._lock:
+                is_continuation = _messages_match_prefix(self._worker_history, messages)
+
+            if is_continuation:
+                delta_msgs = messages[len(self._worker_history):]
+                prompt_blocks = _format_delta_acp_blocks(delta_msgs)
+            else:
+                if self._worker_history:
+                    self._terminate_worker()
+                    worker = self._get_or_spawn_acp_worker(model, effort)
+                prompt_blocks = _format_messages_as_acp_blocks(
+                    messages,
+                    model=model,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    rules_in_workspace=rules,
+                )
+
+            try:
+                req_id = worker.send_prompt(prompt_blocks)
+            except (BrokenPipeError, OSError):
+                self._terminate_worker()
+                worker = self._get_or_spawn_acp_worker(model, effort)
+                prompt_blocks = _format_messages_as_acp_blocks(
+                    messages,
+                    model=model,
+                    tools=tools,
+                    tool_choice=tool_choice,
+                    rules_in_workspace=rules,
+                )
+                req_id = worker.send_prompt(prompt_blocks)
+
+            stream_iter = AntigravityACPStream(
+                worker=worker,
+                req_id=req_id,
+                client=self,
+                model=model,
+                timeout=timeout,
+                tools=tools,
+                is_worker=True,
+                worker_lock=self._worker_lock,
+                worker_lock_held=worker_acquired,
+                messages=messages,
+            )
+            if stream:
+                return stream_iter
+            try:
+                return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
+            finally:
+                if self._worker_lock.locked():
+                    self._worker_lock.release()
+        except Exception:
+            self._terminate_worker()
+            if self._worker_lock.locked():
+                self._worker_lock.release()
+            raise
 
     def _run_oneshot_completion(
         self,
@@ -615,6 +817,18 @@ class AntigravityClient:
             if isinstance(timeout, (int, float)) and timeout > 0
             else _DEFAULT_TIMEOUT_SECONDS
         )
+
+        if self._use_acp:
+            return self._create_acp_completion(
+                model=resolved_model,
+                effort=effort,
+                messages=messages_list,
+                timeout=effective_timeout,
+                tools=tools,
+                tool_choice=tool_choice,
+                stream=stream,
+                reasoning_emitter=reasoning_emitter,
+            )
 
         worker_acquired = self._worker_lock.acquire(blocking=False)
         if worker_acquired:

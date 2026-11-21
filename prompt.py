@@ -2,10 +2,16 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
+import os
 import re
 from types import SimpleNamespace
 from typing import Any, Sequence
+from urllib.parse import unquote, urlparse
+
+_DATA_URI_RE = re.compile(r"^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$", re.DOTALL | re.IGNORECASE)
 
 _ROLE_LABELS = {
     "system": "System",
@@ -33,11 +39,100 @@ _TOOL_CALL_PREFIXES = tuple(
 )
 
 
+def _parse_data_uri(url: str) -> tuple[str, str] | None:
+    match = _DATA_URI_RE.match(url.strip())
+    if not match:
+        return None
+    mime = (match.group(1) or "image/png").strip().lower()
+    data = re.sub(r"\s+", "", match.group(2))
+    if not data:
+        return None
+    return mime, data
+
+
+def _read_local_image(url: str) -> tuple[str, str] | None:
+    path = url.strip()
+    if path.startswith("file://"):
+        path = unquote(urlparse(path).path)
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    mime, _ = mimetypes.guess_type(path)
+    return (mime or "image/png").lower(), base64.b64encode(raw).decode("ascii")
+
+
+def _extract_image_block(item: dict[str, Any]) -> dict[str, Any] | None:
+    """Convert an OpenAI/Anthropic/ACP image part into an ACP ImageContentBlock."""
+    if not isinstance(item, dict):
+        return None
+    kind = item.get("type")
+    if kind == "image":
+        if isinstance(item.get("data"), str) and item["data"]:
+            mime = str(item.get("mimeType") or item.get("mime_type") or "image/png").strip().lower()
+            return {"type": "image", "mimeType": mime, "data": item["data"]}
+        source = item.get("source")
+        if isinstance(source, dict) and source.get("type") == "base64" and source.get("data"):
+            mime = str(source.get("media_type") or "image/png").strip().lower()
+            return {"type": "image", "mimeType": mime, "data": str(source["data"])}
+        return None
+    if kind in ("image_url", "input_image"):
+        raw_url = item.get("image_url")
+        if isinstance(raw_url, dict):
+            url = str(raw_url.get("url") or "")
+        elif isinstance(raw_url, str):
+            url = raw_url
+        else:
+            url = str(item.get("url") or "")
+        if not url:
+            return None
+        parsed = _parse_data_uri(url)
+        if parsed is None and (url.startswith("file://") or os.path.isabs(url)):
+            parsed = _read_local_image(url)
+        if parsed is not None:
+            mime, data = parsed
+            return {"type": "image", "mimeType": mime, "data": data}
+    return None
+
+
+def _extract_images_from_content(content: Any) -> list[dict[str, Any]]:
+    """Collect ACP image blocks from OpenAI list content or Hermes _multimodal envelopes."""
+    if isinstance(content, dict) and content.get("_multimodal"):
+        content = content.get("content")
+    if not isinstance(content, list):
+        return []
+    images: list[dict[str, Any]] = []
+    for item in content:
+        if isinstance(item, dict):
+            blk = _extract_image_block(item)
+            if blk is not None:
+                images.append(blk)
+    return images
+
+
+def _extract_images_from_messages(messages: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
+    images: list[dict[str, Any]] = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            continue
+        role = str(msg.get("role") or "").strip().lower()
+        if role == "system":
+            continue
+        images.extend(_extract_images_from_content(msg.get("content")))
+    return images
+
+
 def _render_message_content(content: Any) -> str:
     """Normalize multimodal or structured message content into a string."""
     if content is None:
         return ""
     if isinstance(content, dict):
+        if content.get("_multimodal") and isinstance(content.get("content"), list):
+            rendered = _render_message_content(content["content"])
+            return rendered or str(content.get("text_summary") or "").strip()
         if "text" in content:
             return str(content.get("text") or "").strip()
         return str(content.get("content") or "").strip()
@@ -47,8 +142,14 @@ def _render_message_content(content: Any) -> str:
             if isinstance(item, str):
                 parts.append(item.strip())
             elif isinstance(item, dict):
-                if item.get("type") == "text":
+                kind = item.get("type")
+                if kind == "text":
                     parts.append(str(item.get("text") or "").strip())
+                elif kind in ("image_url", "input_image"):
+                    raw_url = item.get("image_url")
+                    url = raw_url.get("url", "") if isinstance(raw_url, dict) else str(raw_url or "")
+                    if url.startswith(("http://", "https://")):
+                        parts.append(f"[Image URL: {url}]")
                 elif "content" in item:
                     parts.append(str(item.get("content") or "").strip())
         return "\n".join(p for p in parts if p).strip()
@@ -494,6 +595,56 @@ def _format_delta_prompt(
     else:
         parts.append("Continue the conversation from the latest message above.")
     return "\n\n".join(s.strip() for s in parts if s and s.strip())
+
+
+def _format_messages_as_acp_blocks(
+    messages: list[dict[str, Any]],
+    model: str | None = None,
+    tools: list[dict[str, Any]] | None = None,
+    tool_choice: Any = None,
+    rules_in_workspace: bool = False,
+    max_prompt_chars: int = _MAX_PROMPT_CHARS,
+    max_prompt_bytes: int = _MAX_PROMPT_BYTES,
+) -> list[dict[str, Any]]:
+    """Build ACP ``session/prompt`` content blocks (text + native images)."""
+    text = _format_messages_as_prompt(
+        messages,
+        model=model,
+        tools=tools,
+        tool_choice=tool_choice,
+        rules_in_workspace=rules_in_workspace,
+        max_prompt_chars=max_prompt_chars,
+        max_prompt_bytes=max_prompt_bytes,
+    )
+    images = _extract_images_from_messages(messages)
+    blocks: list[dict[str, Any]] = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    elif images:
+        blocks.append({"type": "text", "text": "User attached an image."})
+    blocks.extend(images)
+    return blocks
+
+
+def _format_delta_acp_blocks(
+    new_messages: Sequence[dict[str, Any]],
+    max_prompt_chars: int = _MAX_PROMPT_CHARS,
+    max_prompt_bytes: int = _MAX_PROMPT_BYTES,
+) -> list[dict[str, Any]]:
+    """Build incremental ACP ``session/prompt`` blocks for a warm worker session."""
+    text = _format_delta_prompt(
+        new_messages,
+        max_prompt_chars=max_prompt_chars,
+        max_prompt_bytes=max_prompt_bytes,
+    )
+    images = _extract_images_from_messages(new_messages)
+    blocks: list[dict[str, Any]] = []
+    if text:
+        blocks.append({"type": "text", "text": text})
+    elif images:
+        blocks.append({"type": "text", "text": "User attached an image."})
+    blocks.extend(images)
+    return blocks
 
 
 def _longest_tool_call_prefix_match(text: str) -> int:

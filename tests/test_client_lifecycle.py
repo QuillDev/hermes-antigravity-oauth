@@ -47,6 +47,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+os.environ["ANTIGRAVITY_TRANSPORT"] = "stream-json"
+
 # Add plugin parent dir to sys.path
 plugin_dir = Path(__file__).resolve().parent.parent
 if str(plugin_dir) not in sys.path:

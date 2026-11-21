@@ -11,6 +11,7 @@ import threading
 import unittest
 from unittest.mock import MagicMock, patch
 
+os.environ["ANTIGRAVITY_TRANSPORT"] = "stream-json"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from thinking import ThinkingReader, decode_thinking, MAX_PAYLOAD
 from stream import AntigravityStream

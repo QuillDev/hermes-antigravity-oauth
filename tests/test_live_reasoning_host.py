@@ -30,6 +30,7 @@ with open(_FAKE_AGY, 'w') as _f:
     _f.write('#!/bin/sh\nexit 0\n')
 os.chmod(_FAKE_AGY, 0o755)
 os.environ['AGY_CLI_PATH'] = _FAKE_AGY
+os.environ['ANTIGRAVITY_TRANSPORT'] = 'stream-json'
 
 # Fallback for a local run without PYTHONPATH; never shadow an explicit checkout.
 sys.path.append(str(Path.home()/'.hermes'/'hermes-agent'))

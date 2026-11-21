@@ -10,7 +10,10 @@ counters, omitted optional fields), and oneshot isolation.
 
 import io
 import json
+import os
 import sys
+
+os.environ["ANTIGRAVITY_TRANSPORT"] = "stream-json"
 import tempfile
 import unittest
 from pathlib import Path
