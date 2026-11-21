@@ -11,6 +11,11 @@ from types import SimpleNamespace
 from typing import Any, Sequence
 from urllib.parse import unquote, urlparse
 
+try:
+    from .host import NAME as _HOST, TITLE as _HOST_TITLE
+except ImportError:  # flat source tree under test
+    from host import NAME as _HOST, TITLE as _HOST_TITLE
+
 _DATA_URI_RE = re.compile(r"^data:([^;,]+)?(?:;[^,]*)?;base64,(.+)$", re.DOTALL | re.IGNORECASE)
 
 _ROLE_LABELS = {
@@ -21,15 +26,15 @@ _ROLE_LABELS = {
 }
 
 _PROMPT_PREAMBLE = (
-    "You are being used strictly as an LLM inference backend for Hermes Agent.",
+    f"You are being used strictly as an LLM inference backend for {_HOST_TITLE} Agent.",
     "You do not possess any local execution tools in this mode. You MUST NOT attempt to invoke native agent tools (such as run_command, write_to_file, view_file, etc.).",
-    "All tool executions and filesystem interactions are performed exclusively by Hermes Agent.",
+    f"All tool executions and filesystem interactions are performed exclusively by {_HOST_TITLE} Agent.",
     "IMPORTANT INSTRUCTIONS FOR TOOLS:",
     "- If you need to call a tool, emit ONLY <tool_call>{...}</tool_call> blocks in your text output.",
     "- Each tool call must be a JSON object containing 'id', 'type': 'function', and 'function': {'name': '...', 'arguments': '...'}.",
     "- 'arguments' must be a JSON-encoded string containing the function arguments.",
-    "- Do NOT execute local shell commands or file operations directly; only output <tool_call> tags so Hermes can execute them safely.",
-    "- NEVER simulate or hallucinate Tool Results (e.g. 'Tool Result (...):'). Hermes Agent executes tools externally and will supply real results in subsequent turns.",
+    f"- Do NOT execute local shell commands or file operations directly; only output <tool_call> tags so {_HOST_TITLE} can execute them safely.",
+    f"- NEVER simulate or hallucinate Tool Results (e.g. 'Tool Result (...):'). {_HOST_TITLE} Agent executes tools externally and will supply real results in subsequent turns.",
     "- After emitting tool calls, STOP generating immediately. Do NOT generate results, execution output, or commentary after tool calls.",
     "- If no tool is needed, respond naturally with standard text.",
 )
@@ -370,7 +375,7 @@ def _format_messages_as_prompt(
             history_messages.append(msg)
 
     if system_parts and not rules_in_workspace:
-        sections.append("### SYSTEM INSTRUCTIONS (HERMES AGENT):\n" + "\n\n".join(f"System:\n{p}" for p in system_parts))
+        sections.append(f"### SYSTEM INSTRUCTIONS ({_HOST.upper()} AGENT):\n" + "\n\n".join(f"System:\n{p}" for p in system_parts))
 
     transcript_items: list[dict[str, Any]] = []
     prior_messages = history_messages[:-1] if last_role == "user" and len(history_messages) > 1 else history_messages

@@ -21,8 +21,10 @@ from datetime import datetime, timezone
 from typing import Any, Callable, NamedTuple
 
 try:
+    from .host import NAME as _HOST
     from .process import _own_process_group, is_authenticated, resolve_agy_command
 except ImportError:  # flat source tree under test
+    from host import NAME as _HOST
     from process import _own_process_group, is_authenticated, resolve_agy_command
 
 # Print-mode slash commands shipped in agy 1.1.11. Older builds send "/usage" to the model as a
@@ -100,7 +102,7 @@ def run_agy(agy: str, args: tuple[str, ...], deadline: float) -> str | None:
     # A private cwd keeps agy from adopting the caller's repository as its workspace. Windows
     # refuses to delete a directory a lingering agy child still sits in; that must not discard a
     # result that was already read.
-    with tempfile.TemporaryDirectory(prefix="hermes-agy-usage-", ignore_cleanup_errors=True) as cwd:
+    with tempfile.TemporaryDirectory(prefix=f"{_HOST}-agy-usage-", ignore_cleanup_errors=True) as cwd:
         job_runner = _windows_job_runner()
         if job_runner is not None:
             result = job_runner(argv, timeout=timeout_s, env=_child_env(), cwd=cwd)

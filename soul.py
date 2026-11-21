@@ -18,6 +18,11 @@ import os
 from pathlib import Path
 from typing import Any, Iterable
 
+try:
+    from .host import NAME as _HOST, TITLE as _HOST_TITLE
+except ImportError:  # flat source tree under test
+    from host import NAME as _HOST, TITLE as _HOST_TITLE
+
 RULES_FILENAME = "GEMINI.md"
 _SOUL_PROBE_CHARS = 240
 
@@ -51,12 +56,12 @@ def _soul_present(soul: str, system_text: str) -> bool:
 def build_rules(system_parts: Iterable[str], preamble: Iterable[str]) -> str:
     system_text = "\n\n".join(p for p in system_parts if p and p.strip())
     soul = read_soul()
-    sections = ["# Hermes Agent workspace rules",
-                "These rules come from Hermes Agent, which drives this session. Follow them for every reply."]
+    sections = [f"# {_HOST_TITLE} Agent workspace rules",
+                f"These rules come from {_HOST_TITLE} Agent, which drives this session. Follow them for every reply."]
     if soul and not _soul_present(soul, system_text):
         sections.append(f"## Persona (SOUL.md)\n\n{soul}")
     if system_text:
-        sections.append(f"## Hermes system prompt\n\n{system_text}")
+        sections.append(f"## {_HOST_TITLE} system prompt\n\n{system_text}")
     sections.append("## Tool contract\n\n" + "\n".join(f"- {line}" if not line.endswith(":") else line
                                                        for line in preamble))
     return "\n\n".join(sections).strip() + "\n"
