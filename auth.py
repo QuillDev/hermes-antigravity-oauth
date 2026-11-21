@@ -16,8 +16,10 @@ import tempfile
 from typing import Any
 
 try:
+    from .host import NAME as _HOST
     from .process import is_authenticated, resolve_agy_command
 except ImportError:  # flat source tree under test
+    from host import NAME as _HOST
     from process import is_authenticated, resolve_agy_command
 
 PROVIDER_ID = "antigravity-oauth"
@@ -65,14 +67,14 @@ def probe(*, live: bool = False) -> dict[str, Any]:
     if live or logged_in:
         logged_in, _, detail = verify_session(agy)
     if not logged_in:
-        detail = f"Not signed in to Antigravity ({detail or 'no saved agy session'}). Run `hermes auth add {PROVIDER_ID}`."
+        detail = f"Not signed in to Antigravity ({detail or 'no saved agy session'}). Run `{_HOST} auth add {PROVIDER_ID}`."
     return {"available": True, "logged_in": logged_in, "plan": "", "command": agy,
             "login_command": login_command(agy), "detail": detail or "signed in"}
 
 
 def _run_login(agy: str) -> int:
     # Private cwd: agy must not pick up the caller's repo as its workspace during sign-in.
-    with tempfile.TemporaryDirectory(prefix="hermes-agy-login-") as cwd:
+    with tempfile.TemporaryDirectory(prefix=f"{_HOST}-agy-login-") as cwd:
         try:
             return subprocess.run(login_command(agy), cwd=cwd, check=False).returncode
         except KeyboardInterrupt:

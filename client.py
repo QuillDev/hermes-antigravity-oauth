@@ -62,6 +62,7 @@ try:
     from .stream import AntigravityStream, collect_stream_completion
     from . import soul as _soul
     from .alias import mask as _mask
+    from .host import NAME as _HOST
 except ImportError:
     from acp import (
         ACP_DEFAULT_ARGS,
@@ -103,6 +104,7 @@ except ImportError:
     from stream import AntigravityStream, collect_stream_completion
     import soul as _soul
     from alias import mask as _mask
+    from host import NAME as _HOST
 
 logger = logging.getLogger(__name__)
 
@@ -285,7 +287,7 @@ class AntigravityClient:
         if cwd:
             self._cwd = cwd
         else:
-            self._temp_dir = tempfile.TemporaryDirectory(prefix="hermes_agy_")
+            self._temp_dir = tempfile.TemporaryDirectory(prefix=f"{_HOST}_agy_")
             self._cwd = self._temp_dir.name
 
         # Isolate agy state and session index from the user's real ~/.gemini/antigravity-cli
