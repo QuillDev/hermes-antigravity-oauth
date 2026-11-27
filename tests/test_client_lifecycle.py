@@ -45,6 +45,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 os.environ["ANTIGRAVITY_TRANSPORT"] = "stream-json"
@@ -1151,6 +1152,257 @@ class TestNeutralizedToolStepDoesNotMisreportAsACrash(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("worker process exited with return code 1", message)
         self.assertIn("agy: fatal: some real startup failure", message)
+
+
+class WorkerLockOwnershipAndACPLifecycleTests(unittest.TestCase):
+    """Behavior tests for worker_lock ownership transfer and ACP stream lifecycle."""
+
+    def setUp(self) -> None:
+        _pin_host_dependent_seams(self)
+        temp_dir = tempfile.TemporaryDirectory(prefix="hermes_agy_lock_test_")
+        self.addCleanup(temp_dir.cleanup)
+        self.temp_dir = temp_dir.name
+
+    def _recording_reacquiring_lock(self):
+        class _NextTurnLock:
+            def __init__(self) -> None:
+                self._lock = threading.Lock()
+                self.releases = 0
+                self.next_turn_acquired = False
+
+            def acquire(self, blocking: bool = True, timeout: float = -1) -> bool:
+                return self._lock.acquire(blocking=blocking, timeout=timeout)
+
+            def release(self) -> None:
+                self.releases += 1
+                self._lock.release()
+                if self.releases == 1:
+                    # Simulate another turn immediately acquiring the worker lock
+                    # as soon as the completed stream releases it.
+                    self.next_turn_acquired = self._lock.acquire(blocking=False)
+
+            def locked(self) -> bool:
+                return self._lock.locked()
+
+        return _NextTurnLock()
+
+    def test_nonstreaming_acp_completion_does_not_release_next_turns_worker_lock(self) -> None:
+        import queue as queue_mod
+
+        with patch.dict(os.environ, {"ANTIGRAVITY_TRANSPORT": "acp"}):
+            client = AntigravityClient(cwd=self.temp_dir)
+        self.assertTrue(client._use_acp)
+        self.addCleanup(client.close)
+        lock = self._recording_reacquiring_lock()
+        client._worker_lock = lock  # type: ignore[assignment]
+
+        incoming: queue_mod.Queue = queue_mod.Queue()
+        incoming.put({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "hello"}}},
+        })
+        incoming.put({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"stopReason": "end_turn", "usage": {"inputTokens": 5, "outputTokens": 2, "totalTokens": 7}},
+        })
+        fake_proc = MagicMock(poll=lambda: None)
+        fake_worker = SimpleNamespace(
+            proc=fake_proc,
+            session_id="sess-acp-1",
+            incoming=incoming,
+            send_prompt=lambda blocks: 1,
+            get_stderr=lambda: "",
+            cancel_turn=lambda: None,
+            close=lambda: None,
+        )
+        client._acp_worker = fake_worker  # type: ignore[assignment]
+        client._worker_proc = fake_proc
+        client._worker_model = MODEL
+        client._worker_effort = None
+
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=list(TURN_MESSAGES),
+                stream=False,
+            )
+            self.assertEqual(resp.choices[0].message.content, "hello")
+            self.assertTrue(lock.next_turn_acquired)
+            self.assertEqual(lock.releases, 1, "client finally released another turn's worker lock")
+            self.assertTrue(lock.locked(), "next turn's worker lock was stolen after completion")
+        finally:
+            if lock.locked():
+                lock._lock.release()
+
+    def test_nonstreaming_stream_json_completion_does_not_release_next_turns_worker_lock(self) -> None:
+        with patch.dict(os.environ, {"ANTIGRAVITY_TRANSPORT": "stream-json"}):
+            client = AntigravityClient(cwd=self.temp_dir)
+        self.addCleanup(client.close)
+        lock = self._recording_reacquiring_lock()
+        client._worker_lock = lock  # type: ignore[assignment]
+
+        result_lines = [
+            json.dumps({"event": "step_update", "step_update": {"step_type": "text", "text_delta": "ok"}}) + "\n",
+            json.dumps({"event": "result", "result": {"status": "SUCCESS"}}) + "\n",
+        ]
+        proc = _RealPollFakeProc(result_lines)
+        proc.stdin = MagicMock()
+        client._worker_proc = proc
+        client._worker_model = MODEL
+        client._worker_effort = None
+
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL,
+                messages=list(TURN_MESSAGES),
+                stream=False,
+            )
+            self.assertEqual(resp.choices[0].message.content, "ok")
+            self.assertTrue(lock.next_turn_acquired)
+            self.assertEqual(lock.releases, 1, "client finally released another turn's worker lock")
+            self.assertTrue(lock.locked(), "next turn's worker lock was stolen after completion")
+        finally:
+            if lock.locked():
+                lock._lock.release()
+
+    def test_nonstreaming_error_after_stream_close_does_not_kill_replacement_worker(self) -> None:
+        import queue as queue_mod
+
+        with patch.dict(os.environ, {"ANTIGRAVITY_TRANSPORT": "acp"}):
+            client = AntigravityClient(cwd=self.temp_dir)
+        self.assertTrue(client._use_acp)
+        self.addCleanup(client.close)
+        lock = self._recording_reacquiring_lock()
+        client._worker_lock = lock  # type: ignore[assignment]
+
+        incoming: queue_mod.Queue = queue_mod.Queue()
+        incoming.put({"jsonrpc": "2.0", "id": 1, "error": {"code": -32000, "message": "boom"}})
+        old_proc = MagicMock(poll=lambda: None)
+        replacement_proc = MagicMock(poll=lambda: None)
+        fake_worker = SimpleNamespace(
+            proc=old_proc,
+            session_id="sess-err",
+            incoming=incoming,
+            send_prompt=lambda blocks: 1,
+            get_stderr=lambda: "",
+            cancel_turn=lambda: None,
+            close=lambda: None,
+        )
+        client._acp_worker = fake_worker  # type: ignore[assignment]
+        client._worker_proc = old_proc
+        client._worker_model = MODEL
+        client._worker_effort = None
+
+        orig_terminate = client._terminate_worker
+
+        def swap_worker_after_first_teardown():
+            orig_terminate()
+            # Simulate a second thread spawning a fresh worker right after teardown
+            if client._worker_proc is None:
+                client._worker_proc = replacement_proc
+
+        client._terminate_worker = swap_worker_after_first_teardown  # type: ignore[method-assign]
+
+        try:
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                client.chat.completions.create(
+                    model=MODEL,
+                    messages=list(TURN_MESSAGES),
+                    stream=False,
+                )
+            self.assertIs(client._worker_proc, replacement_proc)
+            replacement_proc.terminate.assert_not_called()
+            self.assertEqual(lock.releases, 1)
+            self.assertTrue(lock.locked())
+        finally:
+            if lock.locked():
+                lock._lock.release()
+
+    def test_exhausted_acp_worker_stream_stays_closed_without_spawning_second_executor(self) -> None:
+        import asyncio
+        import queue as queue_mod
+        from acp import AntigravityACPStream
+
+        client = AntigravityClient(cwd=self.temp_dir)
+        self.addCleanup(client.close)
+        incoming: queue_mod.Queue = queue_mod.Queue()
+        incoming.put({
+            "jsonrpc": "2.0",
+            "method": "session/update",
+            "params": {"update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "done"}}},
+        })
+        incoming.put({"jsonrpc": "2.0", "id": 1, "result": {"stopReason": "end_turn"}})
+        fake_proc = MagicMock(poll=lambda: None)
+        worker = SimpleNamespace(
+            proc=fake_proc,
+            session_id="sess-async-1",
+            incoming=incoming,
+            get_stderr=lambda: "",
+            cancel_turn=lambda: None,
+            close=lambda: None,
+        )
+        client._worker_proc = fake_proc
+        self.assertTrue(client._worker_lock.acquire(blocking=False))
+        stream = AntigravityACPStream(
+            worker=worker,  # type: ignore[arg-type]
+            req_id=1,
+            client=client,
+            model=MODEL,
+            timeout=10.0,
+            is_worker=True,
+            worker_lock=client._worker_lock,
+            worker_lock_held=True,
+            messages=list(TURN_MESSAGES),
+        )
+
+        async def consume_twice():
+            chunks = [c async for c in stream]
+            first_executor = stream._async_executor
+            self.assertIsNotNone(first_executor)
+            self.assertTrue(stream._closed)
+            with self.assertRaises(StopAsyncIteration):
+                await stream.__anext__()
+            self.assertIs(stream._async_executor, first_executor)
+            return chunks
+
+        chunks = asyncio.run(consume_twice())
+        self.assertTrue(chunks)
+        self.assertFalse(client._worker_lock.locked())
+
+    def test_acp_worker_stderr_retains_last_200_lines_concurrently(self) -> None:
+        import io
+        from acp import ACPWorker
+
+        lines = [f"err-{i}\n" for i in range(250)]
+
+        class _SlowStderr:
+            def __iter__(self):
+                for line in lines:
+                    yield line
+
+        proc = MagicMock()
+        proc.stdout = io.StringIO("")
+        proc.stderr = _SlowStderr()
+        proc.poll.return_value = 0
+
+        worker = ACPWorker(
+            proc=proc,
+            cwd=self.temp_dir,
+            model=MODEL,
+            effort=None,
+            terminate_fn=lambda _p: None,
+        )
+        # Read concurrently while stderr thread drains.
+        for _ in range(20):
+            _ = worker.get_stderr()
+        worker._stderr_thread.join(timeout=5.0)
+        worker._stdout_thread.join(timeout=5.0)
+        stderr_lines = worker.get_stderr().splitlines()
+        self.assertEqual(len(stderr_lines), 200)
+        self.assertEqual(stderr_lines[0], "err-50")
+        self.assertEqual(stderr_lines[-1], "err-249")
 
 
 if __name__ == "__main__":
