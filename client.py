@@ -661,6 +661,7 @@ class AntigravityClient:
                 stream=stream,
                 reasoning_emitter=reasoning_emitter,
             )
+        lock_owned = True
         try:
             rules = self._sync_workspace_rules(messages)
             worker = self._get_or_spawn_acp_worker(model, effort)
@@ -705,20 +706,22 @@ class AntigravityClient:
                 tools=tools,
                 is_worker=True,
                 worker_lock=self._worker_lock,
-                worker_lock_held=worker_acquired,
+                worker_lock_held=lock_owned,
                 messages=messages,
             )
+            lock_owned = False
             if stream:
                 return stream_iter
             try:
                 return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
             finally:
-                if self._worker_lock.locked():
-                    self._worker_lock.release()
+                stream_iter.close()
         except Exception:
-            self._terminate_worker()
-            if self._worker_lock.locked():
-                self._worker_lock.release()
+            if lock_owned:
+                lock_owned = False
+                self._terminate_worker()
+                with contextlib.suppress(RuntimeError):
+                    self._worker_lock.release()
             raise
 
     def _run_oneshot_completion(
@@ -835,6 +838,7 @@ class AntigravityClient:
 
         worker_acquired = self._worker_lock.acquire(blocking=False)
         if worker_acquired:
+            lock_owned = True
             try:
                 rules = self._sync_workspace_rules(messages_list)
                 proc = self._get_or_spawn_worker(resolved_model, effort)
@@ -881,22 +885,24 @@ class AntigravityClient:
                     tools=tools,
                     is_worker=True,
                     worker_lock=self._worker_lock,
-                    worker_lock_held=worker_acquired,
+                    worker_lock_held=lock_owned,
                     messages=messages_list,
                     usage_baseline=worker_usage_baseline,
                     thinking_reader=thinking_reader,
                 )
+                lock_owned = False
                 if stream:
                     return stream_iter
                 try:
                     return collect_stream_completion(stream_iter, reasoning_emitter=reasoning_emitter)
                 finally:
-                    if self._worker_lock.locked():
-                        self._worker_lock.release()
+                    stream_iter.close()
             except Exception:
-                self._terminate_worker()
-                if self._worker_lock.locked():
-                    self._worker_lock.release()
+                if lock_owned:
+                    lock_owned = False
+                    self._terminate_worker()
+                    with contextlib.suppress(RuntimeError):
+                        self._worker_lock.release()
                 raise
         else:
             return self._run_oneshot_completion(

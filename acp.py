@@ -9,6 +9,7 @@ reasoning deltas, multi-turn prompt caching, and per-turn token usage.
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import contextlib
 import json
 import logging
@@ -128,7 +129,8 @@ class ACPWorker:
 
         self.session_id: str = ""
         self.incoming: queue.Queue[dict[str, Any] | None] = queue.Queue()
-        self._stderr_lines: list[str] = []
+        self._stderr_lines: deque[str] = deque(maxlen=200)
+        self._stderr_lock = threading.Lock()
         self._write_lock = threading.Lock()
         self._req_id = 0
         self._closed = False
@@ -176,14 +178,14 @@ class ACPWorker:
             return
         try:
             for line in stderr:
-                self._stderr_lines.append(line.rstrip("\r\n"))
-                if len(self._stderr_lines) > 200:
-                    self._stderr_lines = self._stderr_lines[-200:]
+                with self._stderr_lock:
+                    self._stderr_lines.append(line.rstrip("\r\n"))
         except Exception:
             pass
 
     def get_stderr(self) -> str:
-        return "\n".join(self._stderr_lines).strip()
+        with self._stderr_lock:
+            return "\n".join(self._stderr_lines).strip()
 
     def next_request_id(self) -> int:
         self._req_id += 1
@@ -439,6 +441,9 @@ class AntigravityACPStream(Iterator[Any]):
         try:
             return next(self._generator)
         except StopIteration:
+            if not self.is_worker:
+                self.close()
+            self._closed = True
             self._retire_executor()
             raise
         except Exception:
@@ -476,8 +481,7 @@ class AntigravityACPStream(Iterator[Any]):
     def _retire_executor(self) -> None:
         executor = self._async_executor
         if executor is not None:
-            self._async_executor = None
-            executor.shutdown(wait=False)
+            executor.shutdown(wait=False, cancel_futures=False)
 
     def _release_worker_lock_once(self) -> None:
         if self._worker_lock_held and self.worker_lock is not None:
