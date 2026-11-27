@@ -8,7 +8,7 @@ import mimetypes
 import os
 import re
 from types import SimpleNamespace
-from typing import Any, Sequence
+from typing import Any, Iterator, Sequence
 from urllib.parse import unquote, urlparse
 
 try:
@@ -39,9 +39,19 @@ _PROMPT_PREAMBLE = (
     "- If no tool is needed, respond naturally with standard text.",
 )
 
+_TC_OPEN = "<" + "tool_call"
+_TC_TAG = "<" + "tool_call>"
+_TC_CLOSE = "</" + "tool_call>"
+_TC_CLOSE_TAIL = len(_TC_CLOSE) - 1
+
 _TOOL_CALL_PREFIXES = tuple(
-    "<tool_call>"[:i] for i in range(len("<tool_call>"), 0, -1)
+    _TC_TAG[:i] for i in range(len(_TC_TAG), 0, -1)
 )
+
+
+def _utf8_len(text: str) -> int:
+    """Return UTF-8 byte length without encoding pure-ASCII strings."""
+    return len(text) if text.isascii() else len(text.encode("utf-8"))
 
 
 def _parse_data_uri(url: str) -> tuple[str, str] | None:
@@ -202,25 +212,34 @@ def _fit_transcript_to_budget(
         return []
 
     entries = [item["full"] for item in transcript_items]
+    entry_chars = [len(entry) for entry in entries]
+    entry_bytes = [_utf8_len(entry) for entry in entries]
 
-    def _assembled_size(curr_entries: list[str]) -> tuple[int, int]:
-        if curr_entries:
-            body = "Conversation transcript:\n\n" + "\n\n".join(curr_entries)
-            full = f"{fixed_overhead_text}\n\n{body}" if fixed_overhead_text else body
-        else:
-            full = fixed_overhead_text
-        return len(full), len(full.encode("utf-8"))
-
-    chars, utf8_bytes = _assembled_size(entries)
+    overhead_with_header = (
+        f"{fixed_overhead_text}\n\nConversation transcript:\n\n"
+        if fixed_overhead_text
+        else "Conversation transcript:\n\n"
+    )
+    overhead_chars = len(overhead_with_header)
+    overhead_bytes = _utf8_len(overhead_with_header)
+    sep_total = 2 * (len(entries) - 1)
+    chars = overhead_chars + sep_total + sum(entry_chars)
+    utf8_bytes = overhead_bytes + sep_total + sum(entry_bytes)
     if chars <= max_prompt_chars and utf8_bytes <= max_prompt_bytes:
         return entries
 
     # Pass 1: compact older entries (e.g. large historical assistant tool_calls/text)
     # from oldest to newest before dropping whole turns.
     for idx, item in enumerate(transcript_items):
-        if item["compact"] != entries[idx]:
-            entries[idx] = item["compact"]
-            chars, utf8_bytes = _assembled_size(entries)
+        compact = item["compact"]
+        if compact != entries[idx]:
+            new_chars = len(compact)
+            new_bytes = _utf8_len(compact)
+            chars += new_chars - entry_chars[idx]
+            utf8_bytes += new_bytes - entry_bytes[idx]
+            entries[idx] = compact
+            entry_chars[idx] = new_chars
+            entry_bytes[idx] = new_bytes
             if chars <= max_prompt_chars and utf8_bytes <= max_prompt_bytes:
                 return entries
 
@@ -233,18 +252,13 @@ def _fit_transcript_to_budget(
             latest_user_idx = idx
             break
 
-    overhead_With_header = (
-        f"{fixed_overhead_text}\n\nConversation transcript:\n\n"
-        if fixed_overhead_text
-        else "Conversation transcript:\n\n"
-    )
-    avail_chars = max(2000, max_prompt_chars - len(overhead_With_header))
-    avail_bytes = max(2000, max_prompt_bytes - len(overhead_With_header.encode("utf-8")))
+    avail_chars = max(2000, max_prompt_chars - overhead_chars)
+    avail_bytes = max(2000, max_prompt_bytes - overhead_bytes)
 
     omission_template = "[... {count} earlier transcript messages omitted to preserve latest user request and recent context ...]"
     gap_template = "[... {count} intermediate tool/assistant messages omitted ...]"
     reserve_chars = len(omission_template.format(count=len(entries))) + len(gap_template.format(count=len(entries))) + 16
-    reserve_bytes = len(omission_template.format(count=len(entries)).encode("utf-8")) + len(gap_template.format(count=len(entries)).encode("utf-8")) + 16
+    reserve_bytes = _utf8_len(omission_template.format(count=len(entries))) + _utf8_len(gap_template.format(count=len(entries))) + 16
 
     budget_chars = max(1000, avail_chars - reserve_chars)
     budget_bytes = max(1000, avail_bytes - reserve_bytes)
@@ -259,7 +273,7 @@ def _fit_transcript_to_budget(
             max(500, budget_bytes // 3),
         )
         pinned_user_chars = len(pinned_user_entry) + 2
-        pinned_user_bytes = len(pinned_user_entry.encode("utf-8")) + 2
+        pinned_user_bytes = _utf8_len(pinned_user_entry) + 2
 
     kept_indices: list[int] = []
     used_chars = 0
@@ -279,8 +293,8 @@ def _fit_transcript_to_budget(
         user_res_chars = pinned_user_chars if need_user_reserve else 0
         user_res_bytes = pinned_user_bytes if need_user_reserve else 0
 
-        cand_chars = len(candidate)
-        cand_bytes = len(candidate.encode("utf-8"))
+        cand_chars = entry_chars[idx]
+        cand_bytes = entry_bytes[idx]
 
         if (
             used_chars + sep_chars + cand_chars + user_res_chars <= budget_chars
@@ -298,7 +312,7 @@ def _fit_transcript_to_budget(
                 entries[idx] = _truncate_middle_to_budget(candidate, rem_chars, rem_bytes)
                 kept_indices.append(idx)
                 used_chars += len(entries[idx])
-                used_bytes += len(entries[idx].encode("utf-8"))
+                used_bytes += _utf8_len(entries[idx])
             break
 
     if latest_user_idx is not None and latest_user_idx not in kept_indices and pinned_user_entry is not None:
@@ -707,3 +721,113 @@ def _parse_tool_block(block: str) -> tuple[list[Any], str]:
             )
         )
     return deltas, cleaned_text.strip()
+
+
+class _ToolCallStreamBuffer:
+    """Linear-time streaming extractor for ``<tool_call>...</tool_call>`` blocks.
+
+    Accumulates in-progress tool-call deltas in a list and checks only the
+    trailing boundary window plus each new delta for ``</tool_call>``, avoiding
+    O(N^2) string copies and full-buffer rescans on large tool-call payloads.
+    """
+
+    def __init__(self, *, has_tools: bool) -> None:
+        self._has_tools = has_tools
+        self.has_content = False
+        self.has_tool_calls = False
+        self._in_tool_call = False
+        self._prefix_tail = ""
+        self._tool_parts: list[str] = []
+        self._tool_tail = ""
+
+    @property
+    def has_buffered(self) -> bool:
+        return bool(self._prefix_tail or self._tool_parts)
+
+    def clear(self) -> None:
+        self._in_tool_call = False
+        self._prefix_tail = ""
+        self._tool_parts.clear()
+        self._tool_tail = ""
+
+    def seed_fallback(self, text: str) -> None:
+        if text and not self.has_content and not self.has_tool_calls and not self.has_buffered:
+            self._prefix_tail = text
+
+    def feed(self, text_delta: str) -> Iterator[tuple[str, Any]]:
+        if not text_delta:
+            return
+        if not self._has_tools:
+            self.has_content = True
+            yield ("content", text_delta)
+            return
+
+        pending = text_delta
+        while pending:
+            if self._in_tool_call:
+                window = self._tool_tail + pending
+                end_idx = window.find(_TC_CLOSE)
+                if end_idx != -1:
+                    end_in_pending = end_idx + len(_TC_CLOSE) - len(self._tool_tail)
+                    self._tool_parts.append(pending[:end_in_pending])
+                    block = "".join(self._tool_parts)
+                    self._tool_parts.clear()
+                    self._tool_tail = ""
+                    self._in_tool_call = False
+                    pending = pending[end_in_pending:]
+                    parsed_calls, extra_text = _parse_tool_block(block)
+                    if parsed_calls:
+                        self.has_tool_calls = True
+                        for call_delta in parsed_calls:
+                            yield ("tool_call", call_delta)
+                    if extra_text and not self.has_tool_calls:
+                        self.has_content = True
+                        yield ("content", extra_text)
+                else:
+                    self._tool_parts.append(pending)
+                    self._tool_tail = window[-_TC_CLOSE_TAIL:]
+                    return
+            else:
+                text = self._prefix_tail + pending if self._prefix_tail else pending
+                self._prefix_tail = ""
+                idx = text.find(_TC_OPEN)
+                if idx != -1:
+                    if idx > 0 and not self.has_tool_calls:
+                        self.has_content = True
+                        yield ("content", text[:idx])
+                    self._in_tool_call = True
+                    pending = text[idx:]
+                else:
+                    k = _longest_tool_call_prefix_match(text)
+                    if k > 0:
+                        safe_text = text[:-k]
+                        if safe_text and not self.has_tool_calls:
+                            self.has_content = True
+                            yield ("content", safe_text)
+                        self._prefix_tail = text[-k:]
+                    else:
+                        if not self.has_tool_calls:
+                            self.has_content = True
+                            yield ("content", text)
+                    return
+
+    def flush(self) -> Iterator[tuple[str, Any]]:
+        buf = "".join(self._tool_parts) if self._tool_parts else self._prefix_tail
+        self.clear()
+        if not buf or self.has_tool_calls:
+            return
+        if self._has_tools or _TC_TAG in buf:
+            parsed_calls, extra_text = _parse_tool_block(buf)
+            if parsed_calls:
+                self.has_tool_calls = True
+                for call_delta in parsed_calls:
+                    yield ("tool_call", call_delta)
+            if extra_text and not self.has_tool_calls:
+                self.has_content = True
+                yield ("content", extra_text)
+            elif not parsed_calls:
+                self.has_content = True
+                yield ("content", buf)
+        else:
+            self.has_content = True
+            yield ("content", buf)

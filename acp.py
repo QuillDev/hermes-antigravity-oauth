@@ -24,13 +24,13 @@ try:
     from . import native_tools as _native_tools
     from .alias import StreamUnmasker, mask as _mask, unmask
     from .process import _own_process_group
-    from .prompt import _longest_tool_call_prefix_match, _parse_tool_block
+    from .prompt import _ToolCallStreamBuffer
     from .stream import _ready
 except ImportError:
     import native_tools as _native_tools
     from alias import StreamUnmasker, mask as _mask, unmask
     from process import _own_process_group
-    from prompt import _longest_tool_call_prefix_match, _parse_tool_block
+    from prompt import _ToolCallStreamBuffer
     from stream import _ready
 
 logger = logging.getLogger(__name__)
@@ -39,9 +39,6 @@ ACP_DEFAULT_ARGS: tuple[str, ...] = ("acp", "--include-default-customizations=fa
 _ACP_PROTOCOL_VERSION = 1
 _HANDSHAKE_TIMEOUT_SECONDS = 30.0
 _OUTPUT_LIMIT_STOP_REASONS = frozenset({"max_tokens", "max_output_tokens", "length"})
-_TC_OPEN = "<" + "tool_call"
-_TC_TAG = "<" + "tool_call>"
-_TC_CLOSE = "</" + "tool_call>"
 
 
 def is_acp_args(args: list[str] | tuple[str, ...]) -> bool:
@@ -558,11 +555,8 @@ class AntigravityACPStream(Iterator[Any]):
 
     def _stream_generator(self) -> Iterator[Any]:
         deadline = time.monotonic() + self.timeout
-        text_buffer = ""
+        tool_parser = _ToolCallStreamBuffer(has_tools=self.has_tools)
         usage_raw: dict[str, Any] = {}
-        has_tool_calls = False
-        has_content = False
-        in_tool_call = False
         neutralized_tool_step = False
         output_truncated = False
         saw_result = False
@@ -588,7 +582,7 @@ class AntigravityACPStream(Iterator[Any]):
                     if method == "session/request_permission":
                         self.worker.respond_permission_cancelled(msg.get("id"))
                         tc_obj = (msg.get("params") or {}).get("toolCall")
-                        if not has_tool_calls and isinstance(tc_obj, dict):
+                        if not tool_parser.has_tool_calls and isinstance(tc_obj, dict):
                             translated = self._translate_acp_tool_call(tc_obj)
                             if translated is not None:
                                 logger.info(
@@ -596,8 +590,8 @@ class AntigravityACPStream(Iterator[Any]):
                                     tc_obj.get("name"),
                                     translated.function.name,
                                 )
-                                has_tool_calls = True
-                                text_buffer = ""
+                                tool_parser.has_tool_calls = True
+                                tool_parser.clear()
                                 yield self._make_chunk(tool_calls=[translated])
                                 neutralized_tool_step = True
                                 self.close()
@@ -624,7 +618,7 @@ class AntigravityACPStream(Iterator[Any]):
                         if stop_reason in _OUTPUT_LIMIT_STOP_REASONS:
                             output_truncated = True
                     success = not output_truncated and bool(
-                        has_content or has_tool_calls or text_buffer
+                        tool_parser.has_content or tool_parser.has_tool_calls or tool_parser.has_buffered
                     )
                     break
 
@@ -650,69 +644,17 @@ class AntigravityACPStream(Iterator[Any]):
                     text_delta = content.get("text") if isinstance(content, dict) else ""
                     if not isinstance(text_delta, str) or not text_delta:
                         continue
-                    if not self.has_tools:
-                        has_content = True
-                        yield self._make_chunk(content=text_delta)
-                    else:
-                        text_buffer += text_delta
-                        while text_buffer:
-                            if in_tool_call:
-                                end_idx = text_buffer.find(_TC_CLOSE)
-                                if end_idx != -1:
-                                    full_end = end_idx + len(_TC_CLOSE)
-                                    block = text_buffer[:full_end]
-                                    text_buffer = text_buffer[full_end:]
-                                    in_tool_call = False
-                                    parsed_calls, extra_text = _parse_tool_block(block)
-                                    if parsed_calls:
-                                        has_tool_calls = True
-                                        for call_delta in parsed_calls:
-                                            yield self._make_chunk(tool_calls=[call_delta])
-                                    if extra_text and not has_tool_calls:
-                                        has_content = True
-                                        yield self._make_chunk(content=extra_text)
-                                else:
-                                    break
-                            else:
-                                idx = text_buffer.find(_TC_OPEN)
-                                if idx != -1:
-                                    if idx > 0 and not has_tool_calls:
-                                        safe_text = text_buffer[:idx]
-                                        has_content = True
-                                        yield self._make_chunk(content=safe_text)
-                                    text_buffer = text_buffer[idx:]
-                                    in_tool_call = True
-                                else:
-                                    k = _longest_tool_call_prefix_match(text_buffer)
-                                    if k > 0:
-                                        safe_text = text_buffer[:-k]
-                                        if safe_text and not has_tool_calls:
-                                            has_content = True
-                                            yield self._make_chunk(content=safe_text)
-                                        text_buffer = text_buffer[-k:]
-                                        break
-                                    else:
-                                        if not has_tool_calls:
-                                            has_content = True
-                                            yield self._make_chunk(content=text_buffer)
-                                        text_buffer = ""
+                    for event_kind, payload in tool_parser.feed(text_delta):
+                        if event_kind == "tool_call":
+                            yield self._make_chunk(tool_calls=[payload])
+                        else:
+                            yield self._make_chunk(content=payload)
 
-            if text_buffer and not has_tool_calls:
-                if self.has_tools or _TC_TAG in text_buffer:
-                    parsed_calls, extra_text = _parse_tool_block(text_buffer)
-                    if parsed_calls:
-                        has_tool_calls = True
-                        for call_delta in parsed_calls:
-                            yield self._make_chunk(tool_calls=[call_delta])
-                    if extra_text and not has_tool_calls:
-                        has_content = True
-                        yield self._make_chunk(content=extra_text)
-                    elif not parsed_calls:
-                        has_content = True
-                        yield self._make_chunk(content=text_buffer)
+            for event_kind, payload in tool_parser.flush():
+                if event_kind == "tool_call":
+                    yield self._make_chunk(tool_calls=[payload])
                 else:
-                    has_content = True
-                    yield self._make_chunk(content=text_buffer)
+                    yield self._make_chunk(content=payload)
 
             if not neutralized_tool_step and not saw_result:
                 if time.monotonic() >= deadline:
@@ -732,7 +674,7 @@ class AntigravityACPStream(Iterator[Any]):
             if output_truncated:
                 finish_reason = "length"
             else:
-                finish_reason = "tool_calls" if has_tool_calls else "stop"
+                finish_reason = "tool_calls" if tool_parser.has_tool_calls else "stop"
 
             yield self._make_chunk(finish_reason=finish_reason)
             yield SimpleNamespace(

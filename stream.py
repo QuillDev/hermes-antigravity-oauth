@@ -16,12 +16,12 @@ from typing import Any, Iterator, NamedTuple
 
 try:
     from .process import _check_early_quota_error
-    from .prompt import _longest_tool_call_prefix_match, _parse_tool_block
+    from .prompt import _ToolCallStreamBuffer, _parse_tool_block
     from . import native_tools as _native_tools
     from .alias import StreamUnmasker, unmask
 except ImportError:
     from process import _check_early_quota_error
-    from prompt import _longest_tool_call_prefix_match, _parse_tool_block
+    from prompt import _ToolCallStreamBuffer, _parse_tool_block
     import native_tools as _native_tools
     from alias import StreamUnmasker, unmask
 
@@ -616,11 +616,8 @@ class AntigravityStream(Iterator[Any]):
 
     def _stream_generator(self) -> Iterator[Any]:
         deadline = time.monotonic() + self.timeout
-        text_buffer = ""
+        tool_parser = _ToolCallStreamBuffer(has_tools=self.has_tools)
         usage_data: dict[str, Any] = {}
-        has_tool_calls = False
-        has_content = False
-        in_tool_call = False
         error_msg = ""
         status = ""
         # Positive evidence about how the stream ended: did a `result`
@@ -710,12 +707,12 @@ class AntigravityStream(Iterator[Any]):
                         self.conversation_id = step.get("conversation_id", "")
                     if step.get("step_type") == "tool":
                         call = _native_tools.translate(step, self.tool_names, index=0,
-                                                       resolve=self._resolve_truncated) if not has_tool_calls else None
+                                                       resolve=self._resolve_truncated) if not tool_parser.has_tool_calls else None
                         if call is not None:
                             logger.info("Antigravity native tool '%s' re-issued as Hermes tool '%s'.",
                                         step.get("tool_name"), call.function.name)
-                            has_tool_calls = True
-                            text_buffer = ""
+                            tool_parser.has_tool_calls = True
+                            tool_parser.clear()
                             yield self._make_chunk(tool_calls=[call])
                             self.close()
                             neutralized_tool_step = True
@@ -749,52 +746,11 @@ class AntigravityStream(Iterator[Any]):
 
                     text_delta = step.get("text_delta")
                     if text_delta:
-                        if not self.has_tools:
-                            has_content = True
-                            yield self._make_chunk(content=text_delta)
-                        else:
-                            text_buffer += text_delta
-                            while text_buffer:
-                                if in_tool_call:
-                                    end_idx = text_buffer.find("</tool_call>")
-                                    if end_idx != -1:
-                                        full_end = end_idx + len("</tool_call>")
-                                        block = text_buffer[:full_end]
-                                        text_buffer = text_buffer[full_end:]
-                                        in_tool_call = False
-                                        parsed_calls, extra_text = _parse_tool_block(block)
-                                        if parsed_calls:
-                                            has_tool_calls = True
-                                            for call_delta in parsed_calls:
-                                                yield self._make_chunk(tool_calls=[call_delta])
-                                        if extra_text and not has_tool_calls:
-                                            has_content = True
-                                            yield self._make_chunk(content=extra_text)
-                                    else:
-                                        break
-                                else:
-                                    idx = text_buffer.find("<tool_call")
-                                    if idx != -1:
-                                        if idx > 0 and not has_tool_calls:
-                                            safe_text = text_buffer[:idx]
-                                            has_content = True
-                                            yield self._make_chunk(content=safe_text)
-                                        text_buffer = text_buffer[idx:]
-                                        in_tool_call = True
-                                    else:
-                                        k = _longest_tool_call_prefix_match(text_buffer)
-                                        if k > 0:
-                                            safe_text = text_buffer[:-k]
-                                            if safe_text and not has_tool_calls:
-                                                has_content = True
-                                                yield self._make_chunk(content=safe_text)
-                                            text_buffer = text_buffer[-k:]
-                                            break
-                                        else:
-                                            if not has_tool_calls:
-                                                has_content = True
-                                                yield self._make_chunk(content=text_buffer)
-                                            text_buffer = ""
+                        for event_kind, payload in tool_parser.feed(text_delta):
+                            if event_kind == "tool_call":
+                                yield self._make_chunk(tool_calls=[payload])
+                            else:
+                                yield self._make_chunk(content=payload)
 
                 elif event_type == "result":
                     res = event.get("result", {})
@@ -813,8 +769,7 @@ class AntigravityStream(Iterator[Any]):
                     # Fold a response that never streamed as deltas into the
                     # buffer so the post-loop flush emits it as content.
                     final_resp = res.get("response", "")
-                    if final_resp and not has_content and not has_tool_calls and not text_buffer:
-                        text_buffer = final_resp
+                    tool_parser.seed_fallback(final_resp)
                     # POSITIVE success evidence only: status SUCCESS *and* an
                     # answer that actually exists (streamed content, tool
                     # calls, buffered text, or a response field) *and* no
@@ -842,28 +797,22 @@ class AntigravityStream(Iterator[Any]):
                         status == "SUCCESS"
                         and not error_msg
                         and not output_truncated
-                        and bool(has_content or has_tool_calls or text_buffer or final_resp)
+                        and bool(
+                            tool_parser.has_content
+                            or tool_parser.has_tool_calls
+                            or tool_parser.has_buffered
+                            or final_resp
+                        )
                     )
                     break
 
             self._stop_optional_readers()
             self._join_stdout_reader()
-            if text_buffer and not has_tool_calls:
-                if self.has_tools or "<tool_call>" in text_buffer:
-                    parsed_calls, extra_text = _parse_tool_block(text_buffer)
-                    if parsed_calls:
-                        has_tool_calls = True
-                        for call_delta in parsed_calls:
-                            yield self._make_chunk(tool_calls=[call_delta])
-                    if extra_text and not has_tool_calls:
-                        has_content = True
-                        yield self._make_chunk(content=extra_text)
-                    elif not parsed_calls:
-                        has_content = True
-                        yield self._make_chunk(content=text_buffer)
+            for event_kind, payload in tool_parser.flush():
+                if event_kind == "tool_call":
+                    yield self._make_chunk(tool_calls=[payload])
                 else:
-                    has_content = True
-                    yield self._make_chunk(content=text_buffer)
+                    yield self._make_chunk(content=payload)
 
             if not self.is_worker:
                 try:
@@ -925,7 +874,7 @@ class AntigravityStream(Iterator[Any]):
                 # produced nothing is the empty-result raise's job below,
                 # not this exit-code one. A real nonzero exit keeps the
                 # quota/exit-code raise's priority over the generic one.
-                if not neutralized_tool_step and not has_tool_calls and not has_content and returncode not in (None, 0):
+                if not neutralized_tool_step and not tool_parser.has_tool_calls and not tool_parser.has_content and returncode not in (None, 0):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
@@ -957,7 +906,7 @@ class AntigravityStream(Iterator[Any]):
                             saw_result=saw_result,
                             status=status,
                             process_exit=returncode,
-                            has_evidence=has_content or has_tool_calls,
+                            has_evidence=tool_parser.has_content or tool_parser.has_tool_calls,
                         )
                     )
             else:
@@ -990,7 +939,7 @@ class AntigravityStream(Iterator[Any]):
                 # and is the confirmed root cause of the antigravity-oauth
                 # fast-crash ("worker process exited with return code 1" /
                 # "didn't answer after 3 attempts"), task t_004f4153.
-                if not neutralized_tool_step and not has_tool_calls and not has_content and worker_exit not in (None, 0):
+                if not neutralized_tool_step and not tool_parser.has_tool_calls and not tool_parser.has_content and worker_exit not in (None, 0):
                     quota_err = _check_early_quota_error(gemini_dir, min_mtime=start_time)
                     if quota_err:
                         raise RuntimeError(f"Antigravity model error: {quota_err}")
@@ -1050,14 +999,14 @@ class AntigravityStream(Iterator[Any]):
                             saw_result=saw_result,
                             status=status,
                             process_exit=worker_exit,
-                            has_evidence=has_content or has_tool_calls,
+                            has_evidence=tool_parser.has_content or tool_parser.has_tool_calls,
                         )
                     )
 
             if output_truncated:
                 finish_reason = "length"
             else:
-                finish_reason = "tool_calls" if has_tool_calls else "stop"
+                finish_reason = "tool_calls" if tool_parser.has_tool_calls else "stop"
 
             # Resolve usage (advancing the cumulative worker baseline) BEFORE
             # emitting the finish-reason chunk. The common client pattern
